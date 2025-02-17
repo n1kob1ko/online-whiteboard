@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from "react";
+import React, { useRef, useState, useEffect, useCallback } from "react";
 import {
   Stage,
   Layer,
@@ -25,6 +25,9 @@ const Whiteboard = () => {
   const [fontStyle, setFontStyle] = useState("normal");
   const [selectedElementId, setSelectedElementId] = useState(null);
 
+  // Neuer Modus-State: "draw" = Zeichnen, "pan" = Verschieben
+  const [mode, setMode] = useState("draw");
+
   // Undo/Redo-Stapel
   const [undoStack, setUndoStack] = useState([]);
   const [redoStack, setRedoStack] = useState([]);
@@ -36,7 +39,7 @@ const Whiteboard = () => {
   const currentElement = useRef(null);
   const fileInputRef = useRef(null);
 
-  //Client ID
+  // Client-ID (für Delta-Sync, um eigene Updates zu ignorieren)
   const clientId = useRef(Date.now().toString());
 
   // WebSocket-Referenz für Echtzeit-Kollaboration
@@ -45,50 +48,60 @@ const Whiteboard = () => {
   // Hilfsfunktion zur Erzeugung eindeutiger IDs
   const generateId = () => `${Date.now()}-${Math.random()}`;
 
-  // WebSocket-Verbindung aufbauen
+  // --- WebSocket-Verbindung aufbauen und Delta-Updates empfangen ---
   useEffect(() => {
     socketRef.current = new WebSocket("ws://192.168.0.103:4000");
     socketRef.current.onopen = () => {
       console.log("Mit WebSocket-Server verbunden");
+      // Optional: Bei Verbindung kannst du auch einen "full"-Update anfordern.
     };
     
     socketRef.current.onmessage = (event) => {
-      if (event.data instanceof Blob) {
-        // Falls event.data ein Blob ist, in Text umwandeln
-        event.data.text().then((text) => {
-          try {
-            const data = JSON.parse(text);
-            // Nur verarbeiten, wenn die Nachricht NICHT von uns stammt
-            if (data.clientId !== clientId.current && data.elements) {
-              setElements(data.elements);
-              console.log("Remote Nachricht empfangen:", data);
-            }
-          } catch (err) {
-            console.error("Fehler beim Parsen der Nachricht:", err);
-          }
-        });
-      } else {
+      const processData = (text) => {
         try {
-          const data = JSON.parse(event.data);
-          if (data.clientId !== clientId.current && data.elements) {
+          const data = JSON.parse(text);
+          // Eigene Updates ignorieren
+          if (data.clientId === clientId.current) return;
+          if (data.type === "add" && data.element) {
+            setElements((prev) => [...prev, data.element]);
+            console.log("Remote add received:", data);
+          } else if (data.type === "update" && data.element) {
+            setElements((prev) =>
+              prev.map((el) =>
+                el.id === data.element.id ? data.element : el
+              )
+            );
+            console.log("Remote update received:", data);
+          } else if (data.type === "delete" && data.id) {
+            setElements((prev) =>
+              prev.filter((el) => el.id !== data.id)
+            );
+            console.log("Remote delete received:", data);
+          } else if (data.type === "full" && data.elements) {
             setElements(data.elements);
-            console.log("Remote Nachricht empfangen:", data);
+            console.log("Remote full update received:", data);
           }
         } catch (err) {
           console.error("Fehler beim Parsen der Nachricht:", err);
         }
+      };
+
+      if (event.data instanceof Blob) {
+        event.data.text().then(processData);
+      } else {
+        processData(event.data);
       }
     };
-    
-    
+
     return () => {
       if (socketRef.current) socketRef.current.close();
     };
   }, []);
-  
-  
 
-  // Transformer an das aktuell ausgewählte Element binden
+  // --- Entferne den useEffect, der früher bei jeder Änderung von "elements" ein Update sendet ---
+  // Wir senden Updates jetzt nur als Delta in den spezifischen Event-Handlern.
+
+  // --- Transformer binden ---
   useEffect(() => {
     if (tool === "select" && transformerRef.current) {
       const selectedNode = shapeRefs.current[selectedElementId];
@@ -101,7 +114,7 @@ const Whiteboard = () => {
     }
   }, [selectedElementId, elements, tool]);
 
-  // Throttled-Funktion für kontinuierliche Updates (~60 FPS)
+  // --- Throttled-Pointer-Move für kontinuierliche Updates (nur lokal) ---
   const throttledPointerMove = useRef(
     throttle((point) => {
       if (!currentElement.current) return;
@@ -118,37 +131,34 @@ const Whiteboard = () => {
           el.width = point.x - el.x;
           el.height = point.y - el.y;
           break;
-        case "circle":
-          {
-            const dx = point.x - el.x;
-            const dy = point.y - el.y;
-            el.radius = Math.sqrt(dx * dx + dy * dy);
-          }
+        case "circle": {
+          const dx = point.x - el.x;
+          const dy = point.y - el.y;
+          el.radius = Math.sqrt(dx * dx + dy * dy);
           break;
+        }
         case "ellipse":
           el.radiusX = Math.abs(point.x - el.x);
           el.radiusY = Math.abs(point.y - el.y);
           break;
-        case "triangle":
-          {
-            // Erzeuge ein einfaches gleichschenkliges Dreieck:
-            const x1 = el.startX;
-            const y1 = el.startY;
-            const x2 = point.x;
-            const y2 = point.y;
-            const leftX = x1;
-            const leftY = y2;
-            const rightX = x2;
-            const rightY = y2;
-            const topX = (x1 + x2) / 2;
-            const topY = y1;
-            el.points = [leftX, leftY, topX, topY, rightX, rightY];
-          }
+        case "triangle": {
+          const x1 = el.startX;
+          const y1 = el.startY;
+          const x2 = point.x;
+          const y2 = point.y;
+          const leftX = x1;
+          const leftY = y2;
+          const rightX = x2;
+          const rightY = y2;
+          const topX = (x1 + x2) / 2;
+          const topY = y1;
+          el.points = [leftX, leftY, topX, topY, rightX, rightY];
           break;
+        }
         default:
           break;
       }
-      // Letztes Element im State aktualisieren, um ein Re-Render zu erzwingen
+      // Aktualisiere lokalen Zustand
       setElements((prev) => {
         const newElements = [...prev];
         newElements[newElements.length - 1] = { ...el };
@@ -157,18 +167,21 @@ const Whiteboard = () => {
     }, 16)
   ).current;
 
-  // Pointer-Down-Handler
+  // --- Pointer-Down-Handler ---
   const handlePointerDown = (e) => {
     const stage = stageRef.current;
     if (!stage) return;
-    const point = stage.getPointerPosition();
+    const pos = stage.getPointerPosition();
+    const transform = stage.getAbsoluteTransform().copy().invert();
+    const point = transform.point(pos);
     if (!point) return;
 
-    // Bei Auswahl- oder Radierer-Modus: Wenn auf leeren Bereich geklickt wird, Auswahl löschen
+    // Falls im Auswahl- oder Radierer-Modus: Auswahl löschen oder Element löschen
     if (tool === "select" || tool === "eraser") {
       if (e.target === stage) {
         setSelectedElementId(null);
       }
+      // Bei Eraser wird das Löschen in onClick des Elements gehandhabt
       return;
     }
 
@@ -249,45 +262,59 @@ const Whiteboard = () => {
     }
   };
 
-  // Pointer-Move-Handler
+  // --- Pointer-Move-Handler ---
   const handlePointerMove = (e) => {
     if (!isDrawing) return;
     const stage = stageRef.current;
     if (!stage) return;
-    const point = stage.getPointerPosition();
+    const pos = stage.getPointerPosition();
+    const transform = stage.getAbsoluteTransform().copy().invert();
+    const point = transform.point(pos);
     if (!point) return;
     throttledPointerMove(point);
   };
 
-  // Pointer-Up-Handler: Zeichnung abschließen und in den Undo-Stapel schieben
+  // --- Pointer-Up-Handler: Zeichnung abschließen und Delta-Update senden ---
   const handlePointerUp = () => {
     if (isDrawing) {
-      // Speichere den aktuellen Zustand in den Undo-Stack
       setUndoStack((prev) => [...prev, elements]);
       setRedoStack([]);
-  
-      // Sende das Update nur am Ende des Zeichnens
       if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
-        const update = { clientId: clientId.current, elements };
+        // Sende nur das neu hinzugefügte Element
+        const update = { clientId: clientId.current, type: "add", element: currentElement.current };
         socketRef.current.send(JSON.stringify(update));
-        console.log("Update am Ende des Zeichnens gesendet:", update);
+        console.log("Delta update (add) gesendet:", update);
       }
     }
     setIsDrawing(false);
     currentElement.current = null;
   };
-  
 
-  // Hilfsfunktion zum Aktualisieren eines Elements (z. B. nach Drag/Transform)
+  // --- Funktion zum Aktualisieren eines Elements (z. B. nach Drag/Transform) ---
   const updateElement = (id, newAttrs) => {
-    setElements((prev) =>
-      prev.map((el) => (el.id === id ? { ...el, ...newAttrs } : el))
-    );
+    setElements((prev) => {
+      const updated = prev.map((el) => (el.id === id ? { ...el, ...newAttrs } : el));
+      const updatedElement = updated.find((el) => el.id === id);
+      if (
+        updatedElement &&
+        socketRef.current &&
+        socketRef.current.readyState === WebSocket.OPEN
+      ) {
+        const update = {
+          clientId: clientId.current,
+          type: "update",
+          element: updatedElement
+        };
+        socketRef.current.send(JSON.stringify(update));
+        console.log("Delta update (update) gesendet:", update);
+      }
+      return updated;
+    });
     setUndoStack((prev) => [...prev, elements]);
     setRedoStack([]);
   };
 
-  // Rendert alle Elemente inkl. Eventhandler für Auswahl, Drag & Transform
+  // --- Rendert alle Elemente inkl. Eventhandler für Auswahl, Drag & Transform ---
   const renderElement = (el, index) => {
     const commonProps = {
       ref: (node) => {
@@ -298,7 +325,13 @@ const Whiteboard = () => {
           setSelectedElementId(el.id);
         }
         if (tool === "eraser") {
+          // Lösche Element und sende Delta-Update (delete)
           setElements((prev) => prev.filter((item) => item.id !== el.id));
+          if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+            const update = { clientId: clientId.current, type: "delete", id: el.id };
+            socketRef.current.send(JSON.stringify(update));
+            console.log("Delta update (delete) gesendet:", update);
+          }
           setUndoStack((prev) => [...prev, elements]);
           setRedoStack([]);
         }
@@ -325,7 +358,7 @@ const Whiteboard = () => {
             updateElement(el.id, {
               x: node.x(),
               y: node.y(),
-              radius: el.radius * scaleX // Annahme: gleichmäßige Skalierung
+              radius: el.radius * scaleX
             });
           } else if (el.type === "ellipse") {
             updateElement(el.id, {
@@ -356,6 +389,7 @@ const Whiteboard = () => {
       case "line":
         return (
           <Line
+            key={el.id}
             {...commonProps}
             points={el.points}
             stroke={el.color}
@@ -367,6 +401,7 @@ const Whiteboard = () => {
       case "rectangle":
         return (
           <Rect
+            key={el.id}
             {...commonProps}
             x={el.x}
             y={el.y}
@@ -379,6 +414,7 @@ const Whiteboard = () => {
       case "circle":
         return (
           <Circle
+            key={el.id}
             {...commonProps}
             x={el.x}
             y={el.y}
@@ -390,6 +426,7 @@ const Whiteboard = () => {
       case "ellipse":
         return (
           <Ellipse
+            key={el.id}
             {...commonProps}
             x={el.x}
             y={el.y}
@@ -402,6 +439,7 @@ const Whiteboard = () => {
       case "triangle":
         return (
           <Line
+            key={el.id}
             {...commonProps}
             points={el.points}
             stroke={el.color}
@@ -412,6 +450,7 @@ const Whiteboard = () => {
       case "arrow":
         return (
           <Arrow
+            key={el.id}
             {...commonProps}
             points={el.points}
             stroke={el.color}
@@ -422,6 +461,7 @@ const Whiteboard = () => {
       case "text":
         return (
           <Text
+            key={el.id}
             {...commonProps}
             x={el.x}
             y={el.y}
@@ -450,7 +490,7 @@ const Whiteboard = () => {
               x={el.x + 10}
               y={el.y + 10}
               text={el.text}
-              fill="black"
+              fill="#000000"
               fontSize={el.fontSize}
               width={el.width - 20}
             />
@@ -461,7 +501,7 @@ const Whiteboard = () => {
     }
   };
 
-  // Raster und Hilfslinien (Grid)
+  // --- Raster und Hilfslinien (Grid) ---
   const Grid = () => {
     const gridSize = 50;
     const width = window.innerWidth - 50;
@@ -490,15 +530,14 @@ const Whiteboard = () => {
     return <Layer>{lines}</Layer>;
   };
 
-  // Wheel-Handler für Zoom
+  // --- Wheel-Handler für Zoom ---
   const handleWheel = (e) => {
     e.evt.preventDefault();
     const stage = stageRef.current;
     const oldScale = stage.scaleX();
     const pointer = stage.getPointerPosition();
     const scaleBy = 1.05;
-    const newScale =
-      e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
+    const newScale = e.evt.deltaY < 0 ? oldScale * scaleBy : oldScale / scaleBy;
     stage.scale({ x: newScale, y: newScale });
     const mousePointTo = {
       x: (pointer.x - stage.x()) / oldScale,
@@ -512,7 +551,7 @@ const Whiteboard = () => {
     stage.batchDraw();
   };
 
-  // Undo-/Redo-Funktionen
+  // --- Undo-/Redo-Funktionen ---
   const handleUndo = () => {
     if (undoStack.length > 0) {
       const previous = undoStack[undoStack.length - 1];
@@ -531,7 +570,7 @@ const Whiteboard = () => {
     }
   };
 
-  // Speichern als JSON
+  // --- Speichern als JSON ---
   const saveJSON = () => {
     const dataStr = JSON.stringify(elements);
     const blob = new Blob([dataStr], { type: "application/json" });
@@ -544,7 +583,7 @@ const Whiteboard = () => {
     document.body.removeChild(link);
   };
 
-  // Laden einer JSON-Datei
+  // --- Laden einer JSON-Datei ---
   const loadJSON = (e) => {
     const file = e.target.files[0];
     if (file) {
@@ -563,7 +602,7 @@ const Whiteboard = () => {
     }
   };
 
-  // Export als PNG
+  // --- Export als PNG ---
   const exportPNG = () => {
     const uri = stageRef.current.toDataURL();
     const link = document.createElement("a");
@@ -574,7 +613,7 @@ const Whiteboard = () => {
     document.body.removeChild(link);
   };
 
-  // Export als PDF
+  // --- Export als PDF ---
   const exportPDF = () => {
     const uri = stageRef.current.toDataURL();
     const pdf = new jsPDF("landscape");
@@ -602,6 +641,9 @@ const Whiteboard = () => {
   return (
     <div>
       <div style={toolbarStyle}>
+        <button onClick={() => setMode(mode === "draw" ? "pan" : "draw")}>
+          {mode === "draw" ? "Pan-Modus" : "Zeichnen"}
+        </button>
         <button onClick={() => setTool("pen")}>✏️ Freihand</button>
         <button onClick={() => setTool("rectangle")}>⬛ Rechteck</button>
         <button onClick={() => setTool("circle")}>⚪ Kreis</button>
@@ -655,18 +697,19 @@ const Whiteboard = () => {
         />
       </div>
       <Stage
-        width={window.innerWidth - 50}
-        height={600}
-        onPointerDown={handlePointerDown}
-        onPointerMove={handlePointerMove}
-        onPointerUp={handlePointerUp}
+        width={window.innerWidth}
+        height={window.innerHeight - 100}
+        draggable={mode === "pan"}
+        onPointerDown={mode === "draw" ? handlePointerDown : undefined}
+        onPointerMove={mode === "draw" ? handlePointerMove : undefined}
+        onPointerUp={mode === "draw" ? handlePointerUp : undefined}
         onWheel={handleWheel}
         ref={stageRef}
         style={{
           border: "1px solid #ccc",
           margin: "auto",
           display: "block",
-          touchAction: "none" 
+          touchAction: "none"
         }}
       >
         <Grid />
