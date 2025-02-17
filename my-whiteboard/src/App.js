@@ -19,7 +19,7 @@ const Whiteboard = () => {
   const [isDrawing, setIsDrawing] = useState(false);
   // Verfügbare Tools: "pen", "rectangle", "circle", "ellipse", "triangle", "arrow", "text", "sticky", "select", "eraser"
   const [tool, setTool] = useState("pen");
-  const [color, setColor] = useState("black");
+  const [color, setColor] = useState("#000000");
   const [lineWidth, setLineWidth] = useState(3);
   const [fontFamily, setFontFamily] = useState("Arial");
   const [fontStyle, setFontStyle] = useState("normal");
@@ -36,6 +36,9 @@ const Whiteboard = () => {
   const currentElement = useRef(null);
   const fileInputRef = useRef(null);
 
+  //Client ID
+  const clientId = useRef(Date.now().toString());
+
   // WebSocket-Referenz für Echtzeit-Kollaboration
   const socketRef = useRef(null);
 
@@ -48,24 +51,42 @@ const Whiteboard = () => {
     socketRef.current.onopen = () => {
       console.log("Mit WebSocket-Server verbunden");
     };
+    
     socketRef.current.onmessage = (event) => {
-      // Nachricht verarbeiten
+      if (event.data instanceof Blob) {
+        // Falls event.data ein Blob ist, in Text umwandeln
+        event.data.text().then((text) => {
+          try {
+            const data = JSON.parse(text);
+            // Nur verarbeiten, wenn die Nachricht NICHT von uns stammt
+            if (data.clientId !== clientId.current && data.elements) {
+              setElements(data.elements);
+              console.log("Remote Nachricht empfangen:", data);
+            }
+          } catch (err) {
+            console.error("Fehler beim Parsen der Nachricht:", err);
+          }
+        });
+      } else {
+        try {
+          const data = JSON.parse(event.data);
+          if (data.clientId !== clientId.current && data.elements) {
+            setElements(data.elements);
+            console.log("Remote Nachricht empfangen:", data);
+          }
+        } catch (err) {
+          console.error("Fehler beim Parsen der Nachricht:", err);
+        }
+      }
     };
+    
+    
     return () => {
       if (socketRef.current) socketRef.current.close();
     };
   }, []);
   
-
-  // Sende Updates an den Server, wenn sich die Elemente ändern
-  useEffect(() => {
-    if (
-      socketRef.current &&
-      socketRef.current.readyState === WebSocket.OPEN
-    ) {
-      socketRef.current.send(JSON.stringify({ elements }));
-    }
-  }, [elements]);
+  
 
   // Transformer an das aktuell ausgewählte Element binden
   useEffect(() => {
@@ -241,12 +262,21 @@ const Whiteboard = () => {
   // Pointer-Up-Handler: Zeichnung abschließen und in den Undo-Stapel schieben
   const handlePointerUp = () => {
     if (isDrawing) {
+      // Speichere den aktuellen Zustand in den Undo-Stack
       setUndoStack((prev) => [...prev, elements]);
       setRedoStack([]);
+  
+      // Sende das Update nur am Ende des Zeichnens
+      if (socketRef.current && socketRef.current.readyState === WebSocket.OPEN) {
+        const update = { clientId: clientId.current, elements };
+        socketRef.current.send(JSON.stringify(update));
+        console.log("Update am Ende des Zeichnens gesendet:", update);
+      }
     }
     setIsDrawing(false);
     currentElement.current = null;
   };
+  
 
   // Hilfsfunktion zum Aktualisieren eines Elements (z. B. nach Drag/Transform)
   const updateElement = (id, newAttrs) => {
@@ -260,7 +290,6 @@ const Whiteboard = () => {
   // Rendert alle Elemente inkl. Eventhandler für Auswahl, Drag & Transform
   const renderElement = (el, index) => {
     const commonProps = {
-      key: el.id,
       ref: (node) => {
         shapeRefs.current[el.id] = node;
       },
